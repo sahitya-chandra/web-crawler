@@ -23,8 +23,10 @@ func (cs *CrawledSet) add(url string) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	cs.set[hashUrl(url)] = true
-	cs.length++
+	if !cs.set[hashUrl(url)] {
+		cs.set[hashUrl(url)] = true
+		cs.length++
+	}
 }
 
 func (cs *CrawledSet) contains(url string) bool {
@@ -35,8 +37,8 @@ func (cs *CrawledSet) contains(url string) bool {
 }
 
 func (cs *CrawledSet) size() int {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
 
 	return cs.length
 }
@@ -83,7 +85,7 @@ type ParsePage struct {
 	Err error
 }
 
-func parseHTML(in <-chan PageResult, out chan<- ParsePage, crawled *CrawledSet, q *Queue) {
+func parseHTML(in <-chan PageResult, out chan<- ParsePage, crawled *CrawledSet, q *queue.Queue) {
 	titleRegex := regexp.MustCompile(`(?is)<title>(.*?)</title>`)
 	bodyRegex := regexp.MustCompile(`(?is)<body.*?>(.*?)</body>`)
 	linkRegex := regexp.MustCompile(`(?i)<a\s+(?:[^>]*?\s+)?href="([^"]*)"`)
@@ -102,8 +104,8 @@ func parseHTML(in <-chan PageResult, out chan<- ParsePage, crawled *CrawledSet, 
 		}
 
 		bodyText := ""
-		if match := bodyRegex.FindAllSubmatch(html); len(match) > 1 {
-			bodyText = stripTags(match[1])
+		if match := bodyRegex.FindSubmatch([]byte(html)); len(match) > 1 {
+			bodyText = stripTags(string(match[1]))
 		}
 
 		words := strings.Fields(bodyText)
@@ -112,9 +114,8 @@ func parseHTML(in <-chan PageResult, out chan<- ParsePage, crawled *CrawledSet, 
 		}
 		bodyText = strings.Join(words, " ")
 
-		links := []string{}
-		for _, match := range linkRegex.FindAllSubmatch(html, -1) {
-			link := strings.TrimSpace(match[1])
+		for _, match := range linkRegex.FindAllSubmatch([]byte(html), -1) {
+			link := strings.TrimSpace(string(match[1]))
 			if link != "" {
 				norm, err := normalizeLink(page.URL, link)
 				if err != nil {
