@@ -4,13 +4,18 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
-	"regexp"
+	"os"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/joho/godotenv"
+	"github.com/sahitya-chandra/web-crawler/db"
 	"github.com/sahitya-chandra/web-crawler/queue"
+	"golang.org/x/net/html"
 )
 
 type CrawledSet struct {
@@ -56,8 +61,16 @@ type PageResult struct {
 	Err error
 }
 
+type ParsePage struct {
+	Url string
+	Title string
+	Body string
+	Err error
+}
+
 func fetchHTML(u string, ch chan<- PageResult) {
-	resp, err := http.Get(u)
+	client := &http.Client{Timeout: 10 * time.Second}
+    resp, err := client.Get(u)
 	if err != nil {
 		ch <- PageResult{URL: u, Err: fmt.Errorf("fetch error: %w", err)}
 		return
@@ -78,57 +91,56 @@ func fetchHTML(u string, ch chan<- PageResult) {
 	ch <- PageResult{URL: u, HTML: string(body)}
 }
 
-type ParsePage struct {
-	Url string
-	Title string
-	Body string
-	Err error
-}
 
 func parseHTML(in <-chan PageResult, out chan<- ParsePage, crawled *CrawledSet, q *queue.Queue) {
-	titleRegex := regexp.MustCompile(`(?is)<title>(.*?)</title>`)
-	bodyRegex := regexp.MustCompile(`(?is)<body.*?>(.*?)</body>`)
-	linkRegex := regexp.MustCompile(`(?i)<a\s+(?:[^>]*?\s+)?href="([^"]*)"`)
 
 	for page := range in {
 		if page.Err != nil {
 			out <- ParsePage{Url: page.URL, Err: page.Err}
-			return
+			continue
 		}
 
-		html := page.HTML
+		htmlContent := page.HTML
+		doc, err := html.Parse(strings.NewReader(htmlContent))
+		if err != nil {
+            out <- ParsePage{Url: page.URL, Err: fmt.Errorf("parse error: %w", err)}
+            continue
+        }
 
-		title := ""
-		if match := titleRegex.FindStringSubmatch(html); len(match) > 1 {
-			title = strings.TrimSpace(match[1])
-		}
-
-		bodyText := ""
-		if match := bodyRegex.FindSubmatch([]byte(html)); len(match) > 1 {
-			bodyText = stripTags(string(match[1]))
-		}
-
-		words := strings.Fields(bodyText)
-		if len(words) > 500 {
-			words = words[:500]
-		}
-		bodyText = strings.Join(words, " ")
-
-		for _, match := range linkRegex.FindAllSubmatch([]byte(html), -1) {
-			link := strings.TrimSpace(string(match[1]))
-			if link != "" {
-				norm, err := normalizeLink(page.URL, link)
-				if err != nil {
-					continue
-				}
-
-				if crawled.contains(norm) {
-					continue
-				} else {
-					q.Enqueue(norm)
+		var title, bodyText string
+		var extract func(*html.Node)
+		extract = func(n *html.Node) {
+			if n.Type == html.ElementNode {
+				switch n.Data {
+				case "title":
+					if n.FirstChild != nil {
+						title = strings.TrimSpace(n.FirstChild.Data)
+					}
+				case "body":
+					if n.FirstChild != nil {
+						bodyText = getFirst500Words(n.FirstChild)
+					}
+				case "a":
+					for _, attr := range n.Attr {
+						if attr.Key == "href" {
+							link := strings.TrimSpace(attr.Val)
+							if link != "" {
+								norm, err := normalizeLink(page.URL, link)
+								if err == nil && !crawled.contains(norm) {
+									q.Enqueue(norm)
+								}
+							}
+						}
+					}
 				}
 			}
+
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				extract(c)
+			}
 		}
+		extract(doc)
+		
 
 		out <- ParsePage{
 			Url: page.URL,
@@ -138,9 +150,31 @@ func parseHTML(in <-chan PageResult, out chan<- ParsePage, crawled *CrawledSet, 
 	}
 }
 
-func stripTags(input string) string {
-	re := regexp.MustCompile(`<.*?>`)
-	return re.ReplaceAllString(input, "")
+func getFirst500Words(n *html.Node) string {
+	var buf strings.Builder
+	var traverse func(*html.Node)
+	traverse = func(n *html.Node) {
+		if n.Type == html.TextNode {
+			buf.WriteString(n.Data)
+			if buf.Len() >= 500 {
+				return
+			}
+		}
+
+		for c := n.FirstChild; c != nil; c= c.NextSibling {
+			traverse(c)
+			if buf.Len() >= 500 {
+				return 
+			}
+		}
+	}
+
+	traverse(n)
+	result := strings.TrimSpace(buf.String())
+    if len(result) > 500 {
+        return result[:500]
+    }
+    return result
 }
 
 func normalizeLink(base, href string) (string, error) {
@@ -158,5 +192,73 @@ func normalizeLink(base, href string) (string, error) {
 }
 
 func main() {
-	fmt.Println("hd")
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+
+	uri := os.Getenv("MONGODB_URI")
+	if uri == "" {
+		log.Fatal("MONGODB_URI not set in .env file")
+	}
+
+	dbInstance, err := db.Connect(uri)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer dbInstance.Disconnect()
+
+	queue := &queue.Queue{}
+	crawled := &CrawledSet{set: make(map[uint64]bool)}
+	queue.Enqueue("https://www.mjpru.ac.in/")
+
+	fetchChan := make(chan PageResult, 5)
+	parseChan := make(chan ParsePage, 5)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		parseHTML(fetchChan, parseChan, crawled, queue)
+	}()
+
+	for queue.Size() > 0 && crawled.size() < 500 {
+		url, ok := queue.Dequeue()
+		if !ok {
+			break
+		}
+
+		if crawled.contains(url) {
+			continue
+		}
+
+		crawled.add(url)
+
+		go fetchHTML(url, fetchChan)
+
+		parsed := <-parseChan
+		if parsed.Err != nil {
+			log.Printf("Error parsing %s: %v", parsed.Url, parsed.Err)
+            continue
+		}
+
+		err = dbInstance.InsertWebpage("webpages", map[string]interface{}{
+			"url": parsed.Url,
+			"title": parsed.Title,
+			"content": parsed.Body,
+		})
+
+		if err != nil {
+			log.Printf("Error inserting %s: %v", parsed.Url, err)
+		}
+
+		fmt.Printf("Crawled: %s, Title: %s\n", parsed.Url, parsed.Title)
+        time.Sleep(1 * time.Second) // Polite delay
+
+	}
+
+	
+    close(fetchChan)
+    close(parseChan)
+    wg.Wait()
 }
