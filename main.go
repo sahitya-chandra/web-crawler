@@ -245,7 +245,7 @@ func main() {
 		err = dbInstance.InsertWebpage("webpages", map[string]interface{}{
 			"url": parsed.Url,
 			"title": parsed.Title,
-			"content": parsed.Body,
+			"content": strings.ToValidUTF8(parsed.Body, ""),
 		})
 
 		if err != nil {
