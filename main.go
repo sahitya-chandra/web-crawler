@@ -71,7 +71,7 @@ func main() {
 
 	queue := &queue.Queue{}
 	crawled := &CrawledSet{set: make(map[uint64]bool)}
-	queue.Enqueue("https://www.mjpru.ac.in/")
+	queue.Enqueue("https://example.com/")
 
 	fetchChan := make(chan crawler.PageResult, 5)
 	parseChan := make(chan crawler.ParsePage, 5)
@@ -101,6 +101,10 @@ func main() {
 		if parsed.Err != nil {
 			log.Printf("Error parsing %s: %v", parsed.Url, parsed.Err)
             continue
+		}
+
+		if parsed.Body == "" {
+			log.Printf("Warning: Empty body for URL %s", parsed.Url)
 		}
 
 		err = dbInstance.InsertWebpage("webpages", map[string]interface{}{

@@ -72,68 +72,86 @@ func ParseHTML(
 			continue
 		}
 
-		var title, bodyText string
-		var extract func(*html.Node)
-		extract = func(n *html.Node) {
-			if n.Type == html.ElementNode {
-				switch n.Data {
-				case "title":
-					if n.FirstChild != nil {
-						title = strings.TrimSpace(n.FirstChild.Data)
-					}
-				case "body":
-					if n.FirstChild != nil {
-						bodyText = getFirst500Words(n.FirstChild)
-					}
-				case "a":
-					for _, attr := range n.Attr {
-						if attr.Key == "href" {
-							link := strings.TrimSpace(attr.Val)
-							if link != "" {
-								norm, err := normalizeLink(page.URL, link)
-								if err == nil && !crawledContains(norm) {
-									q.Enqueue(norm)
-								}
-							}
-						}
-					}
-				}
-			}
+        var title, bodyText string
+        var bodyNode *html.Node
+        
+        var extract func(*html.Node)
+        extract = func(n *html.Node) {
+            if n.Type == html.ElementNode {
+                switch n.Data {
+                case "title":
+                    if n.FirstChild != nil && n.FirstChild.Type == html.TextNode {
+                        title = strings.TrimSpace(n.FirstChild.Data)
+                    }
+                case "body":
+                    bodyNode = n
+                case "a":
+                    for _, attr := range n.Attr {
+                        if attr.Key == "href" {
+                            link := strings.TrimSpace(attr.Val)
+                            if link != "" {
+                                norm, err := normalizeLink(page.URL, link)
+                                if err == nil && !crawledContains(norm) {
+                                    q.Enqueue(norm)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
-			for c := n.FirstChild; c != nil; c = c.NextSibling {
-				extract(c)
-			}
-		}
-		extract(doc)
+            for c := n.FirstChild; c != nil; c = c.NextSibling {
+                extract(c)
+            }
+        }
+        extract(doc)
 
-		out <- ParsePage{Url: page.URL, Title: title, Body: bodyText}
-	}
+        if bodyNode != nil {
+            bodyText = getFirst500Words(bodyNode)
+        }
+
+        out <- ParsePage{Url: page.URL, Title: title, Body: bodyText}
+    }
 }
 
 func getFirst500Words(n *html.Node) string {
-	var buf strings.Builder
-	var traverse func(*html.Node)
-	traverse = func(n *html.Node) {
-		if n.Type == html.TextNode {
-			buf.WriteString(n.Data)
-			if buf.Len() >= 500 {
-				return
-			}
-		}
+    var buf strings.Builder
+    wordCount := 0
+    
+    var traverse func(*html.Node) bool
+    traverse = func(n *html.Node) bool {
+        if wordCount >= 500 {
+            return false
+        }
+        
+        if n.Type == html.TextNode {
+            text := strings.TrimSpace(n.Data)
+            if text != "" {
+                // count words in curr text node
+                words := strings.Fields(text)
+                for _, word := range words {
+                    if wordCount >= 500 {
+                        break
+                    }
+                    if buf.Len() > 0 {
+                        buf.WriteString(" ")
+                    }
+                    buf.WriteString(word)
+                    wordCount++
+                }
+            }
+        }
 
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			traverse(c)
-			if buf.Len() >= 500 {
-				return
-			}
-		}
-	}
-	traverse(n)
-	result := strings.TrimSpace(buf.String())
-	if len(result) > 500 {
-		return result[:500]
-	}
-	return result
+        for c := n.FirstChild; c != nil; c = c.NextSibling {
+            if !traverse(c) {
+                return false
+            }
+        }
+        return true
+    }
+    
+    traverse(n)
+    return buf.String()
 }
 
 func normalizeLink(base, href string) (string, error) {
