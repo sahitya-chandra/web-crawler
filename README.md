@@ -1,96 +1,68 @@
 # Web Crawler
 
-A simple and extensible web crawler written in Go.
+A simple web crawler written in Go that fetches, parses, and archives web pages into MongoDB.
 
-## Overview
+Built as a learning project to explore Go's concurrency primitives, HTTP handling, and HTML parsing.
 
-This project is a basic web crawler designed to fetch, parse, and archive web pages into a MongoDB database. It demonstrates core crawling techniques such as queue-based URL management, polite crawling, parallel fetching, HTML parsing, and duplicate avoidance.
+## Setup
 
-## Features
+Requires **Go 1.24+** and a running **MongoDB** instance.
 
-- Fetches and parses HTML from web pages
-- Extracts page titles, main body content, and hyperlinks
-- Enqueues new links for further crawling (breadth-first)
-- Polite crawling with delays between requests
-- Prevents duplicate crawling using hashed URL tracking
-- Stores page data (URL, title, content) in MongoDB
-- Modular structure (crawler, queue, db, main)
-
-## Getting Started
-
-### Prerequisites
-
-- Go 1.24+
-- A running MongoDB instance (local or remote)
-- `git` for cloning the repository
-
-### Installation
-
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/sahitya-chandra/web-crawler.git
-   cd web-crawler
-   ```
-
-2. **Install dependencies:**
-   ```bash
-   go mod download
-   ```
-
-3. **Set up environment variables:**
-   - Create a `.env` file in the root directory:
-     ```
-     MONGODB_URI=mongodb://localhost:27017
-     ```
-
-### Usage
-
-1. **Run the crawler:**
-   ```bash
-   go run main.go
-   ```
-
-   By default, the crawler starts at `https://example.com/` and archives up to 500 pages (can be changed in `main.go`).
-
-2. **Database Output:**
-   - Crawled web pages are stored in the `crawlerArchive.webpages` collection in MongoDB.
-   - Each document contains:
-     - `url`: The crawled URL
-     - `title`: Page title
-     - `content`: Main body content (first 500 words)
-
-### Project Structure
-
-- `main.go` — Entry point; orchestrates queueing, crawling, and database storage
-- `crawler/` — Fetches and parses HTML, extracts links and content
-- `queue/` — Thread-safe queue implementation for URLs
-- `db/` — MongoDB connection and basic storage helpers
-
-### Example Output
-
-```
-Crawled: https://example.com/, Title: Example Domain
+```bash
+git clone https://github.com/sahitya-chandra/web-crawler.git
+cd web-crawler
+go mod download
 ```
 
-## Configuration
+Create a `.env` file:
 
-- Adjust the starting URL, maximum pages, or crawling logic in `main.go` as needed.
-- MongoDB URI and other secrets are managed via the `.env` file.
+```
+MONGODB_URI=mongodb://localhost:27017
+```
 
-## Dependencies
+## Usage
 
-- [Go MongoDB Driver](https://go.mongodb.org/mongo-driver/)
-- [godotenv](https://github.com/joho/godotenv)
-- [golang.org/x/net/html](https://pkg.go.dev/golang.org/x/net/html)
+```bash
+go run main.go                                    # defaults: example.com, 500 pages
+go run main.go -url https://go.dev/ -max 100      # custom URL and limit
+go run main.go -delay 500ms                       # faster crawling
+```
 
-## License
+| Flag          | Default                | Description                      |
+|---------------|------------------------|----------------------------------|
+| `-url`        | `https://example.com/` | Starting URL to crawl            |
+| `-max`        | `500`                  | Maximum pages to crawl           |
+| `-delay`      | `1s`                   | Delay between requests           |
+| `-db`         | `crawlerArchive`       | MongoDB database name            |
+| `-collection` | `webpages`             | MongoDB collection name          |
 
-This project is for educational/demo purposes. No license specified.
+## How It Works
 
-## Contributing
+1. Dequeues a URL from a FIFO queue
+2. Fetches the page via HTTP (with timeout and `User-Agent`)
+3. Parses HTML to extract the title, body text (first 500 words), and links
+4. Stores the page in MongoDB
+5. Enqueues discovered links that haven't been seen yet
+6. Waits for the configured delay, then repeats
 
-Pull requests and suggestions are welcome!
+Stops when the queue is empty, the page limit is reached, or `Ctrl+C` is pressed.
 
----
+## Project Structure
 
-> Results may be incomplete. See the [GitHub code search results for more](https://github.com/sahitya-chandra/web-crawler/search?q=crawl+OR+crawler+OR+web+OR+spider+OR+scrape+OR+scraping+OR+url+OR+fetch+OR+parse+OR+download+OR+visit).
+```
+main.go              Entry point — CLI flags, crawl loop, graceful shutdown
+crawler/crawler.go   HTTP fetching, HTML parsing, link normalization
+queue/queue.go       Thread-safe FIFO URL queue
+db/db.go             MongoDB connection and document insertion
+```
+
+## Make Targets
+
+```bash
+make build    # compile binary
+make run      # build and run
+make test     # run tests with race detector  (go test -race ./...)
+make fmt      # format code
+make check    # fmt + vet + test
+make clean    # remove binary
+```
