@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"log"
 
 	"go.mongodb.org/mongo-driver/mongo"
@@ -9,59 +10,52 @@ import (
 )
 
 type DB struct {
-	Client *mongo.Client
+	client   *mongo.Client
+	database string
 }
 
-func Connect(uri string) (*DB, error) {
-	
-	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri))
+func Connect(ctx context.Context, uri, database string) (*DB, error) {
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("mongo connect: %w", err)
 	}
 
-	err = client.Ping(context.TODO(), nil)
-	if err != nil {
-		return nil, err
+	if err := client.Ping(ctx, nil); err != nil {
+		return nil, fmt.Errorf("mongo ping: %w", err)
 	}
 
-	log.Println("Connected to MongoDB!")
+	log.Println("Connected to MongoDB")
 
-	collection := client.Database("crawlerArchive").Collection("webpages")
-    if err := collection.Drop(context.Background()); err != nil {
-        log.Printf("Warning: Failed to drop collection: %v", err)
-    } else {
-        log.Println("Dropped webpages collection on restart")
-    }
-	
-	return &DB {
-		Client: client,
+	return &DB{
+		client:   client,
+		database: database,
 	}, nil
 }
 
-func (db *DB) Disconnect() error {
-	if db.Client == nil {
+func (db *DB) Disconnect(ctx context.Context) error {
+	if db.client == nil {
 		return nil
 	}
 
-	err := db.Client.Disconnect(context.TODO())
-	if err != nil {
-		return err
+	if err := db.client.Disconnect(ctx); err != nil {
+		return fmt.Errorf("mongo disconnect: %w", err)
 	}
 
-	log.Println("Disconnected from MongoDB!")
+	log.Println("Disconnected from MongoDB")
 	return nil
 }
 
-// func (db *DB) GetCollection(database, collection string) *mongo.Collection {
-// 	return db.Client.Database(database).Collection(collection)
-// }
+type Webpage struct {
+	URL     string `bson:"url"`
+	Title   string `bson:"title"`
+	Content string `bson:"content"`
+}
 
-func (db *DB) InsertWebpage(collection string, data interface{}) error {
-    coll := db.Client.Database("crawlerArchive").Collection(collection)
-    _, err := coll.InsertOne(context.TODO(), data)
-    if err != nil {
-        log.Printf("Failed to insert into %s: %v", collection, err)
-        return err
-    }
-    return nil
+func (db *DB) InsertWebpage(ctx context.Context, collection string, page Webpage) error {
+	coll := db.client.Database(db.database).Collection(collection)
+	_, err := coll.InsertOne(ctx, page)
+	if err != nil {
+		return fmt.Errorf("insert into %s: %w", collection, err)
+	}
+	return nil
 }

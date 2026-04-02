@@ -1,129 +1,158 @@
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
-	"hash/fnv"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/sahitya-chandra/web-crawler/crawler"
 	"github.com/sahitya-chandra/web-crawler/db"
 	"github.com/sahitya-chandra/web-crawler/queue"
-	"github.com/sahitya-chandra/web-crawler/crawler"
 )
 
-type CrawledSet struct {
-	set map[uint64]bool
-	length int
-	mu sync.RWMutex
+type config struct {
+	startURL   string
+	maxPages   int
+	delay      time.Duration
+	database   string
+	collection string
 }
 
-func (cs *CrawledSet) add(url string) {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
-	if !cs.set[hashUrl(url)] {
-		cs.set[hashUrl(url)] = true
-		cs.length++
-	}
+func parseFlags() config {
+	cfg := config{}
+	flag.StringVar(&cfg.startURL, "url", "https://example.com/", "starting URL to crawl")
+	flag.IntVar(&cfg.maxPages, "max", 500, "maximum number of pages to crawl")
+	flag.DurationVar(&cfg.delay, "delay", 1*time.Second, "delay between requests (e.g. 500ms, 2s)")
+	flag.StringVar(&cfg.database, "db", "crawlerArchive", "MongoDB database name")
+	flag.StringVar(&cfg.collection, "collection", "webpages", "MongoDB collection name")
+	flag.Parse()
+	return cfg
 }
 
-func (cs *CrawledSet) contains(url string) bool {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-
-	return cs.set[hashUrl(url)]
+// visited tracks which URLs have already been crawled using a concurrent-safe set.
+type visited struct {
+	set map[string]bool
+	mu  sync.RWMutex
 }
 
-func (cs *CrawledSet) size() int {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-
-	return cs.length
+func (v *visited) add(url string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.set[url] = true
 }
 
-func hashUrl(url string) uint64 {
-	h := fnv.New64a()
-	h.Write([]byte(url))
+func (v *visited) contains(url string) bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.set[url]
+}
 
-	return h.Sum64()
+func (v *visited) size() int {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return len(v.set)
 }
 
 func main() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
-	}
+	cfg := parseFlags()
+
+	_ = godotenv.Load()
 
 	uri := os.Getenv("MONGODB_URI")
 	if uri == "" {
-		log.Fatal("MONGODB_URI not set in .env file")
+		log.Fatal("MONGODB_URI not set — create a .env file or export the variable")
 	}
 
-	dbInstance, err := db.Connect(uri)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer dbInstance.Disconnect()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	queue := &queue.Queue{}
-	crawled := &CrawledSet{set: make(map[uint64]bool)}
-	queue.Enqueue("https://example.com/")
-
-	fetchChan := make(chan crawler.PageResult, 5)
-	parseChan := make(chan crawler.ParsePage, 5)
-
-	var wg sync.WaitGroup
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
-		crawler.ParseHTML(fetchChan, parseChan, crawled.contains, queue)
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		log.Println("Shutting down gracefully...")
+		cancel()
 	}()
 
-	for queue.Size() > 0 && crawled.size() < 500 {
-		url, ok := queue.Dequeue()
+	dbInstance, err := db.Connect(ctx, uri, cfg.database)
+	if err != nil {
+		log.Fatalf("Database connection failed: %v", err)
+	}
+	defer func() {
+		if err := dbInstance.Disconnect(context.Background()); err != nil {
+			log.Printf("Error disconnecting: %v", err)
+		}
+	}()
+
+	crawl(ctx, cfg, dbInstance)
+}
+
+func crawl(ctx context.Context, cfg config, dbInstance *db.DB) {
+	q := &queue.Queue{}
+	seen := &visited{set: make(map[string]bool)}
+
+	q.Enqueue(cfg.startURL)
+
+	crawled := 0
+
+	for !q.IsEmpty() && crawled < cfg.maxPages {
+		if ctx.Err() != nil {
+			log.Println("Crawl cancelled")
+			break
+		}
+
+		url, ok := q.Dequeue()
 		if !ok {
 			break
 		}
 
-		if crawled.contains(url) {
+		if seen.contains(url) {
 			continue
 		}
 
-		crawled.add(url)
+		result := crawler.FetchHTML(ctx, url)
 
-		go crawler.FetchHTML(url, fetchChan)
+		seen.add(url)
 
-		parsed := <-parseChan
+		parsed := crawler.ParseHTML(result)
 		if parsed.Err != nil {
-			log.Printf("Error parsing %s: %v", parsed.Url, parsed.Err)
-            continue
+			log.Printf("Skipped %s: %v", parsed.URL, parsed.Err)
+			continue
 		}
 
-		if parsed.Body == "" {
-			log.Printf("Warning: Empty body for URL %s", parsed.Url)
+		page := db.Webpage{
+			URL:     parsed.URL,
+			Title:   parsed.Title,
+			Content: strings.ToValidUTF8(parsed.Body, ""),
+		}
+		if err := dbInstance.InsertWebpage(ctx, cfg.collection, page); err != nil {
+			log.Printf("Insert failed for %s: %v", parsed.URL, err)
 		}
 
-		err = dbInstance.InsertWebpage("webpages", map[string]interface{}{
-			"url": parsed.Url,
-			"title": parsed.Title,
-			"content": strings.ToValidUTF8(parsed.Body, ""),
-		})
-
-		if err != nil {
-			log.Printf("Error inserting %s: %v", parsed.Url, err)
+		for _, link := range parsed.Links {
+			if !seen.contains(link) {
+				q.Enqueue(link)
+			}
 		}
 
-		fmt.Printf("Crawled: %s, Title: %s\n", parsed.Url, parsed.Title)
-        time.Sleep(1 * time.Second) // Polite delay
+		crawled++
+		fmt.Printf("[%d/%d] %s — %s\n", crawled, cfg.maxPages, parsed.URL, parsed.Title)
 
+		select {
+		case <-ctx.Done():
+			log.Println("Crawl cancelled")
+			return
+		case <-time.After(cfg.delay):
+		}
 	}
 
-	
-    close(fetchChan)
-    close(parseChan)
-    wg.Wait()
+	log.Printf("Done. Crawled %d pages.", crawled)
 }

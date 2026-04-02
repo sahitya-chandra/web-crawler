@@ -5,10 +5,8 @@ import (
 )
 
 type Queue struct {
-	totalQueued int
-	length int
 	urls []string
-	mu sync.Mutex
+	mu   sync.RWMutex
 }
 
 func (q *Queue) Enqueue(url string) {
@@ -16,8 +14,6 @@ func (q *Queue) Enqueue(url string) {
 	defer q.mu.Unlock()
 
 	q.urls = append(q.urls, url)
-	q.totalQueued++
-	q.length++
 }
 
 func (q *Queue) Dequeue() (string, bool) {
@@ -29,12 +25,19 @@ func (q *Queue) Dequeue() (string, bool) {
 	}
 	url := q.urls[0]
 	q.urls = q.urls[1:]
-	q.length--
 	return url, true
 }
 
 func (q *Queue) Size() int {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.length
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+
+	return len(q.urls)
+}
+
+func (q *Queue) IsEmpty() bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+
+	return len(q.urls) == 0
 }
